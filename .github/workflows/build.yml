@@ -1,0 +1,46 @@
+name: Build PDFCheck.exe
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: python -m pip install pyinstaller pymupdf customtkinter tkinterdnd2
+
+      - name: Build exe
+        run: >
+          python -m PyInstaller --noconfirm --onefile --windowed --name PDFCheck
+          --collect-all tkinterdnd2 --collect-all customtkinter pdfcheck.pyw
+
+      - name: Smoke test (import bundled modules)
+        run: python -c "import pymupdf, customtkinter, tkinterdnd2; print('ok')"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PDFCheck
+          path: dist/PDFCheck.exe
+
+      - name: Publish release "latest"
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete latest --yes --cleanup-tag || true
+          gh release create latest dist/PDFCheck.exe \
+            --title "PDF Check (последняя сборка)" \
+            --notes "Скачайте PDFCheck.exe и запустите двойным кликом. Python не нужен." \
+            --target "$GITHUB_SHA"
