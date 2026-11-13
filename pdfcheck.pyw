@@ -593,6 +593,132 @@ def run_gui(initial_files):
         return ctk.CTkFrame(parent, fg_color=CARD, corner_radius=14, border_width=1,
                             border_color=BORDER, **kw)
 
+    # --- подсказки ----------------------------------------------------------
+    class Tip:
+        """Всплывающая подсказка при наведении."""
+
+        def __init__(self, widget, text):
+            self.text, self.win, self.job = text, None, None
+            for seq, fn in (("<Enter>", self.enter), ("<Leave>", self.hide), ("<ButtonPress>", self.hide)):
+                try:
+                    widget.bind(seq, fn, add="+")
+                except Exception:
+                    pass
+
+        def enter(self, _e=None):
+            self.hide()
+            self.job = root.after(350, self.show)
+
+        def show(self):
+            self.job = None
+            try:
+                scale = ctk.ScalingTracker.get_window_scaling(root)
+                dark = ctk.get_appearance_mode() == "Dark"
+                win = tk.Toplevel(root)
+                win.wm_overrideredirect(True)
+                try:
+                    win.attributes("-topmost", True)
+                except Exception:
+                    pass
+                tk.Label(win, text=self.text, justify="left", wraplength=int(320 * scale),
+                         bg="#2b3242" if not dark else "#e9ecf2", fg="#ffffff" if not dark else "#131722",
+                         font=(family or "TkDefaultFont", 9), padx=10, pady=8, bd=0).pack()
+                win.update_idletasks()
+                x, y = root.winfo_pointerx() + 14, root.winfo_pointery() + 18
+                x = max(4, min(x, root.winfo_screenwidth() - win.winfo_reqwidth() - 8))
+                if y + win.winfo_reqheight() > root.winfo_screenheight() - 8:
+                    y = root.winfo_pointery() - win.winfo_reqheight() - 12
+                win.wm_geometry("+%d+%d" % (x, y))
+                self.win = win
+            except Exception:
+                self.win = None
+
+        def hide(self, _e=None):
+            if self.job:
+                root.after_cancel(self.job)
+                self.job = None
+            if self.win:
+                try:
+                    self.win.destroy()
+                except Exception:
+                    pass
+                self.win = None
+
+    def hint(parent, text):
+        """Значок «?» с подсказкой."""
+        lab = ctk.CTkLabel(parent, text="?", width=18, height=18, corner_radius=9, font=F(11, "bold"),
+                           fg_color=SEG, text_color=MUTED)
+        try:
+            lab.configure(cursor="question_arrow")
+        except Exception:
+            pass
+        Tip(lab, text)
+        return lab
+
+    HELP = [
+        ("1. Впишите размеры из ТЗ",
+         "Слева одна строка на каждый баннер: ширина и высота обязательны. Выберите, в чём они "
+         "записаны: в сантиметрах или миллиметрах.\n"
+         "Если ТЗ пришло текстом, нажмите «Вставить списком» и вставьте его целиком."),
+        ("2. Назовите файлы как позиции в ТЗ",
+         "Если в имени файла есть название позиции, программа сверит размер именно с ней: файл "
+         "«Л1_верх.pdf» сверяется с позицией «Л1 верх».\n"
+         "Если названия нет или в одном PDF несколько страниц, позиция подбирается по размеру страницы."),
+        ("3. Выберите расстояние",
+         "С какого расстояния люди будут смотреть на баннер. Детская зона, стойка, ролл-ап: 0,5–1 м. "
+         "Стена в зале: 2–3 м. Фасад и улица: 5 м.\n"
+         "Если типография назвала своё минимальное разрешение, впишите его в «Дополнительных "
+         "настройках»: оно важнее расстояния."),
+        ("4. Добавьте макеты",
+         "Перетащите PDF-файлы или папку в окно либо нажмите «Добавить PDF». После правок в макете "
+         "пересохраните PDF и нажмите «Перечитать»."),
+        ("5. Прочитайте результат",
+         "Зелёный «Готов»: можно отдавать в печать.\n"
+         "Жёлтый «Проверить»: посмотрите причину и решите сами, например RGB или повёрнутый макет.\n"
+         "Красный «Ошибка»: нужно исправить, например размер не по ТЗ, низкое разрешение или "
+         "невстроенные шрифты.\n"
+         "Клик по карточке раскрывает все проверки и список картинок с их разрешением."),
+        ("Масштаб макета",
+         "Макет может быть сделан в масштабе 1:2, 1:5, 1:10. Программа определяет это сама, сравнивая "
+         "с ТЗ, и пишет масштаб на карточке. Без ТЗ масштаб нужно указать вручную в дополнительных "
+         "настройках, иначе разрешение посчитается неверно."),
+        ("Что значит разрешение",
+         "Программа считает, сколько пикселей картинки приходится на дюйм баннера в натуральную "
+         "величину. Если мало, вблизи будут видны пиксели. У вектора и текста в кривых разрешения "
+         "нет: они чёткие при любом размере.\n"
+         "Низкое разрешение у фона на весь макет критично, у мелкой детали на 1% площади обычно нет: "
+         "доля площади указана в списке картинок."),
+        ("Чего программа не видит",
+         "Картинку, которую растянули из маленькой ещё до вставки в макет: разрешение будет "
+         "хорошим, а изображение мыльным. Артефакты сжатия JPEG. Ошибки в тексте и содержании. "
+         "Поэтому важные макеты всё равно просмотрите глазами в масштабе 100%."),
+    ]
+
+    def show_help():
+        win = ctk.CTkToplevel(root)
+        win.title("Как пользоваться PDF Check")
+        win.geometry("600x680+%d+%d" % (root.winfo_rootx() + 120, root.winfo_rooty() + 40))
+        win.configure(fg_color=BG)
+        win.transient(root)
+        area = ctk.CTkScrollableFrame(win, fg_color="transparent")
+        area.pack(fill="both", expand=True, padx=10, pady=(12, 0))
+        for head, body_text in HELP:
+            box = card(area)
+            box.pack(fill="x", padx=6, pady=(0, 10))
+            ctk.CTkLabel(box, text=head, font=F(14, "bold"), text_color=TEXT, anchor="w").pack(
+                fill="x", padx=16, pady=(12, 2))
+            ctk.CTkLabel(box, text=body_text, font=F(13), text_color=TEXT, anchor="w", justify="left",
+                         wraplength=500).pack(fill="x", padx=16, pady=(0, 12))
+        button(win, "Понятно", win.destroy, primary=True, width=140).pack(pady=12)
+
+        def front():
+            try:
+                win.lift()
+                win.focus_set()
+            except Exception:
+                pass
+        win.after(250, front)
+
     # === боковая панель ======================================================
     side = card(root, width=380)
     side.pack(side="left", fill="y", padx=(16, 0), pady=16)
@@ -601,12 +727,20 @@ def run_gui(initial_files):
     brand = ctk.CTkFrame(side, fg_color="transparent")
     brand.pack(fill="x", padx=18, pady=(16, 4))
     ctk.CTkLabel(brand, text=APP_NAME, font=F(20, "bold"), text_color=TEXT).pack(side="left")
-    theme_btn = ctk.CTkButton(brand, text="", width=92, height=28, corner_radius=8, font=F(12),
+    theme_btn = ctk.CTkButton(brand, text="", width=64, height=28, corner_radius=8, font=F(12),
                               fg_color=SOFT, hover_color=BORDER, text_color=MUTED)
     theme_btn.pack(side="right")
+    ctk.CTkButton(brand, text="Как пользоваться", width=120, height=28, corner_radius=8, font=F(12),
+                  fg_color=SOFT, hover_color=BORDER, text_color=ACCENT,
+                  command=lambda: show_help()).pack(side="right", padx=6)
 
-    ctk.CTkLabel(side, text="Размеры из ТЗ", font=F(14, "bold"), text_color=TEXT).pack(
-        anchor="w", padx=18, pady=(12, 0))
+    tz_head = ctk.CTkFrame(side, fg_color="transparent")
+    tz_head.pack(fill="x", padx=18, pady=(12, 0))
+    ctk.CTkLabel(tz_head, text="Размеры из ТЗ", font=F(14, "bold"), text_color=TEXT).pack(side="left")
+    hint(tz_head, "Одна строка на каждый баннер из задания. Ширина и высота обязательны.\n\n"
+                  "Название нужно, чтобы привязать файл по имени: файл «Л1_верх.pdf» сверится "
+                  "с позицией «Л1 верх». Без названия позиция подбирается по размеру.\n\n"
+                  "«шт» заполняйте, если одинаковых баннеров несколько.").pack(side="left", padx=8)
     ctk.CTkLabel(side, text="Размер обязателен, название и количество по желанию",
                  font=F(12), text_color=MUTED).pack(anchor="w", padx=18)
 
@@ -757,13 +891,20 @@ def run_gui(initial_files):
     urow = ctk.CTkFrame(bottom, fg_color="transparent")
     urow.pack(fill="x", pady=(8, 0))
     ctk.CTkLabel(urow, text="Единицы в ТЗ", font=F(13), text_color=TEXT).pack(side="left")
+    hint(urow, "В чём записаны ширина и высота в списке выше. На сами макеты не влияет: "
+               "они могут быть в любом масштабе.").pack(side="left", padx=8)
     ctk.CTkSegmentedButton(urow, values=["см", "мм"], variable=v_unit, font=F(13), height=30,
                            fg_color=SEG, unselected_color=SEG,
                            unselected_hover_color=BORDER, selected_color=SEG_SEL,
                            selected_hover_color=SEG_SEL, text_color=TEXT).pack(side="right")
 
-    ctk.CTkLabel(bottom, text="С какого расстояния смотрят", font=F(13), text_color=TEXT).pack(
-        anchor="w", pady=(14, 4))
+    drow = ctk.CTkFrame(bottom, fg_color="transparent")
+    drow.pack(fill="x", pady=(14, 4))
+    ctk.CTkLabel(drow, text="С какого расстояния смотрят", font=F(13), text_color=TEXT).pack(side="left")
+    hint(drow, "Чем ближе зритель, тем выше нужно разрешение картинок.\n\n"
+               "0,5–1 м: детская зона, стойка, ролл-ап, меню.\n"
+               "2–3 м: стена в зале, витрина.\n"
+               "5 м: фасад, улица, баннер под потолком.").pack(side="left", padx=8)
     ctk.CTkSegmentedButton(bottom, values=DISTANCES, variable=v_dist, font=F(13), height=32,
                            fg_color=SEG, unselected_color=SEG,
                            unselected_hover_color=BORDER, selected_color=SEG_SEL,
@@ -776,27 +917,39 @@ def run_gui(initial_files):
     adv_btn.pack(fill="x", pady=(10, 0))
     adv = ctk.CTkFrame(bottom, fg_color=SOFT, corner_radius=10)
 
-    def adv_row(row, label, widget_factory, hint):
+    def adv_row(row, label, widget_factory, unit_text, tip):
         ctk.CTkLabel(adv, text=label, font=F(12), text_color=TEXT).grid(
             row=row, column=0, sticky="w", padx=(12, 8), pady=4)
         widget_factory().grid(row=row, column=1, sticky="w", pady=4)
-        ctk.CTkLabel(adv, text=hint, font=F(12), text_color=MUTED).grid(
-            row=row, column=2, sticky="w", padx=(6, 10))
+        ctk.CTkLabel(adv, text=unit_text, font=F(12), text_color=MUTED, width=28, anchor="w").grid(
+            row=row, column=2, sticky="w", padx=(6, 4))
+        hint(adv, tip).grid(row=row, column=3, sticky="w", padx=(0, 10))
 
     def entry(var):
         return lambda: ctk.CTkEntry(adv, textvariable=var, width=70, height=28, corner_radius=7,
                                     font=F(12), border_color=BORDER, fg_color=CARD)
 
-    adv_row(0, "Свой порог", entry(v_ppi), "ppi")
+    adv_row(0, "Свой порог", entry(v_ppi), "ppi",
+            "Если типография назвала минимальное разрешение, например 100 ppi, впишите его сюда: "
+            "оно заменит расчёт по расстоянию. Пусто: считать по расстоянию.")
     adv_row(1, "Масштаб 1:", lambda: ctk.CTkComboBox(
         adv, variable=v_scale, width=70, height=28, corner_radius=7, font=F(12),
         values=["Авто", "1", "2", "5", "10", "20", "100"], border_color=BORDER, fg_color=CARD,
-        button_color=BORDER, command=lambda _v: schedule()), "")
-    adv_row(2, "Допуск размера", entry(v_tol), "мм")
-    adv_row(3, "Припуск на сторону", entry(v_allow), "мм")
+        button_color=BORDER, command=lambda _v: schedule()), "",
+            "«Авто»: программа сама поймёт, что макет сделан 1:2, 1:5 или 1:10, сравнив его с ТЗ.\n\n"
+            "Если ТЗ не заполнено, а макеты в масштабе, выберите его вручную, иначе разрешение "
+            "посчитается неверно.")
+    adv_row(2, "Допуск размера", entry(v_tol), "мм",
+            "На сколько миллиметров размер макета может отличаться от ТЗ и всё ещё считаться верным.")
+    adv_row(3, "Припуск на сторону", entry(v_allow), "мм",
+            "Если типография просит добавить поля под подгиб, карманы или люверсы, впишите их размер "
+            "на одну сторону. Тогда макет размером «ТЗ + припуск со всех сторон» тоже считается верным.")
     ctk.CTkSwitch(adv, text="RGB считать предупреждением", variable=v_rgb, font=F(12),
                   progress_color=ACCENT, text_color=TEXT).grid(
         row=4, column=0, columnspan=3, sticky="w", padx=12, pady=(6, 10))
+    hint(adv, "Печать идёт в CMYK, и яркие RGB-цвета могут потускнеть. Выключите, если типография "
+              "сама принимает RGB: тогда RGB не будет менять статус макета.").grid(
+        row=4, column=3, sticky="w", padx=(0, 10), pady=(6, 10))
 
     def render_adv():
         adv_btn.configure(text=("▾  " if state["adv"] else "▸  ") + "Дополнительные настройки")
@@ -820,15 +973,25 @@ def run_gui(initial_files):
     top.pack(fill="x")
     title = ctk.CTkLabel(top, text="Макеты", font=F(22, "bold"), text_color=TEXT, anchor="w")
     title.pack(side="left")
-    button(top, "Сохранить отчёт", lambda: save_report()).pack(side="right")
-    button(top, "Копировать отчёт", lambda: copy_report()).pack(side="right", padx=8)
+    b_save = button(top, "Сохранить отчёт", lambda: save_report())
+    b_save.pack(side="right")
+    b_copy = button(top, "Копировать отчёт", lambda: copy_report())
+    b_copy.pack(side="right", padx=8)
+    Tip(b_save, "Сохранить результаты всех проверок в текстовый файл, например чтобы отправить дизайнеру.")
+    Tip(b_copy, "Скопировать тот же отчёт в буфер обмена, чтобы вставить в мессенджер или письмо.")
 
     tools = ctk.CTkFrame(main, fg_color="transparent")
     tools.pack(fill="x", pady=(12, 0))
     button(tools, "+  Добавить PDF", lambda: add_files(), primary=True).pack(side="left")
-    button(tools, "Папка", lambda: add_folder()).pack(side="left", padx=8)
-    button(tools, "Перечитать", lambda: recheck()).pack(side="left")
-    button(tools, "Очистить", lambda: clear()).pack(side="left", padx=8)
+    b_folder = button(tools, "Папка", lambda: add_folder())
+    b_folder.pack(side="left", padx=8)
+    b_reload = button(tools, "Перечитать", lambda: recheck())
+    b_reload.pack(side="left")
+    b_clear = button(tools, "Очистить", lambda: clear())
+    b_clear.pack(side="left", padx=8)
+    Tip(b_folder, "Добавить все PDF из папки вместе с вложенными папками.")
+    Tip(b_reload, "Заново прочитать файлы с диска. Нажмите после того, как исправили и пересохранили макет.")
+    Tip(b_clear, "Убрать все макеты из списка. Сами файлы и ТЗ не трогаются.")
     filt = ctk.CTkSegmentedButton(tools, values=["Все"], variable=v_filter, font=F(13), height=34,
                                   fg_color=SEG, unselected_color=SEG,
                            unselected_hover_color=BORDER, selected_color=SEG_SEL,
@@ -870,7 +1033,7 @@ def run_gui(initial_files):
         data = {"unit": v_unit.get(), "distance": v_dist.get(), "min_ppi": v_ppi.get(),
                 "scale": v_scale.get(), "tol": v_tol.get(), "allow": v_allow.get(),
                 "rgb_warn": v_rgb.get(), "tz_rows": rows_data(),
-                "theme": ctk.get_appearance_mode().lower(), "adv": state["adv"]}
+                "theme": ctk.get_appearance_mode().lower(), "adv": state["adv"], "help_seen": True}
         try:
             with open(settings_path(), "w", encoding="utf-8") as fh:
                 json.dump(data, fh, ensure_ascii=False, indent=1)
@@ -878,7 +1041,7 @@ def run_gui(initial_files):
             pass
 
     def render_theme():
-        theme_btn.configure(text="Тёмная тема" if ctk.get_appearance_mode() == "Light" else "Светлая тема")
+        theme_btn.configure(text="Тёмная" if ctk.get_appearance_mode() == "Light" else "Светлая")
 
     def toggle_theme():
         ctk.set_appearance_mode("dark" if ctk.get_appearance_mode() == "Light" else "light")
@@ -934,7 +1097,7 @@ def run_gui(initial_files):
         ctk.CTkButton(head, text="✕", width=30, height=28, corner_radius=8, font=F(13),
                       fg_color="transparent", hover_color=SOFT, text_color=MUTED,
                       command=lambda: remove_row_card(r)).pack(side="right")
-        ctk.CTkLabel(head, text="Скрыть ▴" if is_open else "Подробнее ▾", font=F(12),
+        ctk.CTkLabel(head, text="Скрыть ▴" if is_open else "Все проверки ▾", font=F(12),
                      text_color=MUTED).pack(side="right", padx=8)
 
         if r["meta"]:
@@ -988,7 +1151,8 @@ def run_gui(initial_files):
                 empty_title.configure(text="Перетащите PDF или папку сюда" if dnd else "Добавьте PDF-файлы")
                 empty_hint.configure(text="1. Слева впишите размеры из ТЗ\n"
                                           "2. Добавьте PDF с макетами\n"
-                                          "3. Красные карточки нужно исправить, зелёные готовы")
+                                          "3. Красные карточки нужно исправить, зелёные готовы\n\n"
+                                          "Подробнее: кнопка «Как пользоваться» слева вверху")
             title.configure(text="Макеты")
             filt.pack_forget()
             state["filters"] = {}
@@ -1223,6 +1387,8 @@ def run_gui(initial_files):
     refresh()
     add_paths(initial_files)
     poll()
+    if not saved.get("help_seen") and not initial_files:
+        root.after(600, show_help)
     return root
 
 
