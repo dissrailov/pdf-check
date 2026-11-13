@@ -114,6 +114,55 @@ def cs_label(info):
     return info.get("cs-name") or "?"
 
 
+def _cs_from_text(doc, text, depth=0):
+    """Разбор значения /ColorSpace из словаря картинки."""
+    text = text.strip()
+    if depth > 4 or not text:
+        return None
+    m = re.match(r"^(\d+)\s+\d+\s+R$", text)
+    if m:
+        return _cs_from_text(doc, doc.xref_object(int(m.group(1)), compressed=True), depth + 1)
+    body = text.lstrip("[ ").strip()
+    if body.startswith(("/DeviceCMYK", "/CalCMYK")):
+        return "CMYK"
+    if body.startswith(("/DeviceRGB", "/CalRGB")):
+        return "RGB"
+    if body.startswith(("/DeviceGray", "/CalGray")):
+        return "Gray"
+    if body.startswith("/Lab"):
+        return "Lab"
+    if body.startswith(("/Separation", "/DeviceN")):
+        return "Spot"
+    if body.startswith("/ICCBased"):
+        m = re.match(r"/ICCBased\s+(\d+)\s+\d+\s+R", body)
+        if m:
+            n = doc.xref_get_key(int(m.group(1)), "N")[1]
+            return {"4": "CMYK", "3": "RGB", "1": "Gray"}.get(n.strip())
+        return None
+    if body.startswith("/Indexed"):
+        rest = body[len("/Indexed"):].strip()
+        m = re.match(r"^(\d+\s+\d+\s+R|\[.*?\]|/\w+)", rest, re.S)
+        return _cs_from_text(doc, m.group(1), depth + 1) if m else None
+    return None
+
+
+def image_cs(doc, info):
+    """Цветовая модель картинки так, как она записана в файле."""
+    xref = info.get("xref") or 0
+    if xref > 0:
+        try:
+            if doc.xref_get_key(xref, "ImageMask")[1] == "true":
+                return "Mask"
+            kind, value = doc.xref_get_key(xref, "ColorSpace")
+            if kind != "null":
+                found = _cs_from_text(doc, value)
+                if found:
+                    return found
+        except Exception:
+            pass
+    return cs_label(info)
+
+
 def vector_has_rgb(doc, page):
     chunks = []
     try:
@@ -154,11 +203,18 @@ def analyze_pdf(path):
                 if dw <= 0 or dh <= 0:
                     continue
                 images.append({"px_w": pw, "px_h": ph, "w_mm": dw * PT_TO_MM,
-                               "h_mm": dh * PT_TO_MM, "cs": cs_label(info)})
+                               "h_mm": dh * PT_TO_MM, "cs": image_cs(doc, info)})
             missing = sorted({f[3] for f in doc.get_page_fonts(pno, full=True)
                               if f[1] == "n/a" and f[2] != "Type3"})
             has_text = bool(page.get_text("text").strip())
+            thumb = None
+            try:
+                z = 76.0 / max(page.rect.width, page.rect.height, 1.0)
+                thumb = page.get_pixmap(matrix=fitz.Matrix(z, z), alpha=False).tobytes("ppm")
+            except Exception:
+                pass
             res["pages"].append({
+                "thumb": thumb,
                 "pno": pno + 1, "w_mm": w * PT_TO_MM, "h_mm": h * PT_TO_MM,
                 "bleed_mm": bleed * PT_TO_MM if bleed > 0.5 else 0.0,
                 "images": images, "missing_fonts": missing, "has_text": has_text,
@@ -314,15 +370,20 @@ def evaluate(docs, specs, st):
             checks.append((OK, "Шрифты", "встроены или в кривых.", []))
 
         # цвет
-        rgb_imgs = sum(1 for im in p["images"] if im["cs"] == "RGB")
+        rgb_list = [im for im in p["images"] if im["cs"] == "RGB"]
+        rgb_imgs = len(rgb_list)
+        rgb_sub = ["RGB   %d × %d px   на баннере %s" % (
+            im["px_w"], im["px_h"], fmt_size(im["w_mm"] * scale, im["h_mm"] * scale, unit))
+            for im in sorted(rgb_list, key=lambda i: -i["w_mm"] * i["h_mm"])[:10]]
         if rgb_imgs or p["vec_rgb"]:
             parts = []
             if rgb_imgs:
-                parts.append("картинок в RGB: %d" % rgb_imgs)
+                parts.append("картинок в RGB: %d из %d" % (rgb_imgs, len(p["images"])))
             if p["vec_rgb"]:
                 parts.append("RGB в векторе или тексте")
             checks.append((WARN if st["rgb_warn"] else INFO, "Цвет",
-                           "%s. В CMYK-печати яркие цвета могут потускнеть." % "; ".join(parts), []))
+                           "%s. В CMYK-печати яркие цвета могут потускнеть."
+                           % "; ".join(parts), rgb_sub))
         else:
             checks.append((OK, "Цвет", "RGB не найден.", []))
 
@@ -442,7 +503,7 @@ def run_gui(initial_files):
     except Exception:
         root = ctk.CTk()
     root.title(APP_NAME + ": проверка макетов перед печатью")
-    root.geometry("1280x800")
+    root.geometry("1320x820")
     root.minsize(1040, 640)
     root.configure(fg_color=BG)
 
@@ -462,7 +523,7 @@ def run_gui(initial_files):
     v_filter = tk.StringVar(value="Все")
 
     state = {"docs": [], "rows": [], "summary": None, "bad": [], "job": None, "busy": 0,
-             "open": set(), "adv": bool(saved.get("adv", False)), "wrap": [], "filters": {}}
+             "open": set(), "thumbs": {}, "adv": bool(saved.get("adv", False)), "wrap": [], "filters": {}}
     q = queue.Queue()
 
     def button(parent, text, command, primary=False, width=0, **kw):
@@ -479,7 +540,7 @@ def run_gui(initial_files):
                             border_color=BORDER, **kw)
 
     # === боковая панель ======================================================
-    side = card(root, width=350)
+    side = card(root, width=380)
     side.pack(side="left", fill="y", padx=(16, 0), pady=16)
     side.pack_propagate(False)
 
@@ -492,20 +553,144 @@ def run_gui(initial_files):
 
     ctk.CTkLabel(side, text="Размеры из ТЗ", font=F(14, "bold"), text_color=TEXT).pack(
         anchor="w", padx=18, pady=(12, 0))
-    ctk.CTkLabel(side, text="Одна позиция на строку, например:  Л1 верх 110x110",
+    ctk.CTkLabel(side, text="Размер обязателен, название и количество по желанию",
                  font=F(12), text_color=MUTED).pack(anchor="w", padx=18)
 
-    # нижняя часть панели пакуется первой, чтобы поле ТЗ занимало всё остальное
+    # нижняя часть панели пакуется первой, чтобы список ТЗ занимал всё остальное
     bottom = ctk.CTkFrame(side, fg_color="transparent")
     bottom.pack(side="bottom", fill="x", padx=18, pady=(0, 16))
 
-    tz = ctk.CTkTextbox(side, font=ctk.CTkFont(family=mono, size=13), wrap="none", corner_radius=10,
-                        fg_color=SOFT, border_width=1, border_color=BORDER, text_color=TEXT)
-    tz.pack(fill="both", expand=True, padx=18, pady=(8, 8))
-    tz.insert("1.0", saved.get("tz", ""))
+    tz_box = ctk.CTkScrollableFrame(side, fg_color=SOFT, corner_radius=10, border_width=1,
+                                    border_color=BORDER)
+    tz_box.pack(fill="both", expand=True, padx=18, pady=(8, 6))
+    tz_rows = []
+
+    def row_empty(row):
+        return not any(row[k].get().strip() for k in ("name", "w", "h", "n"))
+
+    def remove_row(row):
+        row["frame"].destroy()
+        tz_rows.remove(row)
+        if not tz_rows:
+            add_row()
+        schedule()
+
+    def add_row(values=("", "", "", ""), focus=False):
+        fr = ctk.CTkFrame(tz_box, fg_color="transparent")
+        fr.pack(fill="x", pady=2)
+        row = {"frame": fr}
+        ctk.CTkButton(fr, text="✕", width=24, height=30, corner_radius=7, font=F(12),
+                      fg_color="transparent", hover_color=BORDER, text_color=MUTED,
+                      command=lambda: remove_row(row)).pack(side="right")
+
+        def ent(key, placeholder, width, value, expand=False):
+            e = ctk.CTkEntry(fr, placeholder_text=placeholder, width=width, height=30, corner_radius=7,
+                             font=F(12), border_width=1, border_color=BORDER, fg_color=CARD,
+                             text_color=TEXT)
+            if value:
+                e.insert(0, value)
+            e.bind("<KeyRelease>", lambda _e: schedule())
+            e.bind("<Return>", lambda _e: add_row(focus=True))
+            row[key] = e
+            return e
+
+        ent("n", "шт", 36, values[3]).pack(side="right", padx=(4, 0))
+        ent("h", "Выс.", 52, values[2]).pack(side="right")
+        ctk.CTkLabel(fr, text="×", font=F(12), text_color=MUTED, width=14).pack(side="right")
+        ent("w", "Шир.", 52, values[1]).pack(side="right")
+        ent("name", "Название", 90, values[0]).pack(side="left", fill="x", expand=True, padx=(0, 6))
+        tz_rows.append(row)
+        if focus:
+            row["name"].focus_set()
+        return row
+
+    def add_specs(specs):
+        k = UNIT_MM[v_unit.get()]
+        for row in [r for r in tz_rows if row_empty(r)]:
+            row["frame"].destroy()
+            tz_rows.remove(row)
+        for sp in specs:
+            add_row((sp.name, fmt_num(sp.w / k), fmt_num(sp.h / k), str(sp.count) if sp.count > 1 else ""))
+        if not tz_rows:
+            add_row()
+
+    def get_specs():
+        k = UNIT_MM[v_unit.get()]
+        specs, bad = [], []
+        for i, row in enumerate(tz_rows, 1):
+            name, ws, hs, ns = (row[key].get().strip() for key in ("name", "w", "h", "n"))
+            if not (name or ws or hs or ns):
+                for key in ("w", "h", "n"):
+                    row[key].configure(border_color=BORDER)
+                continue
+            w, h = to_float(ws), to_float(hs)
+            n = 1 if not ns else (int(ns) if ns.isdigit() and int(ns) >= 1 else None)
+            row["w"].configure(border_color=BORDER if w else S_BAR[FAIL])
+            row["h"].configure(border_color=BORDER if h else S_BAR[FAIL])
+            row["n"].configure(border_color=BORDER if n else S_BAR[FAIL])
+            if w and h and n:
+                specs.append(Spec(name, w * k, h * k, n))
+            else:
+                bad.append(name or "строка %d" % i)
+        return specs, bad
+
+    def rows_data():
+        return [[row[key].get().strip() for key in ("name", "w", "h", "n")]
+                for row in tz_rows if not row_empty(row)]
+
+    def clear_tz():
+        for row in list(tz_rows):
+            row["frame"].destroy()
+        tz_rows.clear()
+        for _ in range(4):
+            add_row()
+        schedule()
+
+    def paste_dialog():
+        win = ctk.CTkToplevel(root)
+        win.title("Вставить размеры списком")
+        win.geometry("480x440")
+        win.configure(fg_color=BG)
+        win.transient(root)
+        ctk.CTkLabel(win, justify="left", anchor="w", font=F(13), text_color=TEXT,
+                     text="Вставьте текст из ТЗ, по одной позиции на строку.\n"
+                          "Подойдёт любой вид записи:").pack(fill="x", padx=18, pady=(16, 2))
+        ctk.CTkLabel(win, justify="left", anchor="w", text_color=MUTED,
+                     font=ctk.CTkFont(family=mono, size=12),
+                     text="Л1 верх 110x110\nЛ3 (низ) 110 × 97 см\nБаннер 1100*2180 мм 6 шт").pack(
+            fill="x", padx=18)
+        box = ctk.CTkTextbox(win, font=ctk.CTkFont(family=mono, size=13), corner_radius=10,
+                             fg_color=CARD, border_width=1, border_color=BORDER, text_color=TEXT)
+        box.pack(fill="both", expand=True, padx=18, pady=10)
+        msg = ctk.CTkLabel(win, text="", justify="left", anchor="w", font=F(12),
+                           text_color=S_FG[WARN], wraplength=440)
+        msg.pack(fill="x", padx=18)
+
+        def apply():
+            specs, bad = parse_specs(box.get("1.0", "end"), v_unit.get())
+            add_specs(specs)
+            schedule()
+            if bad:
+                box.delete("1.0", "end")
+                box.insert("1.0", "\n".join(bad))
+                msg.configure(text="Добавлено позиций: %d. В оставшихся строках не нашёл размер "
+                                   "вида 110x218: поправьте их или закройте окно." % len(specs))
+            else:
+                win.destroy()
+
+        button(win, "Добавить в ТЗ", apply, primary=True).pack(anchor="e", padx=18, pady=(8, 16))
+        win.after(150, lambda: (win.lift(), box.focus_set()))
+
+    tz_btns = ctk.CTkFrame(bottom, fg_color="transparent")
+    tz_btns.pack(fill="x", pady=(0, 6))
+    for text, cmd in (("+ Позиция", lambda: add_row(focus=True)), ("Вставить списком", paste_dialog),
+                      ("Очистить", clear_tz)):
+        ctk.CTkButton(tz_btns, text=text, command=cmd, height=28, width=10, corner_radius=8,
+                      font=F(12), fg_color=SOFT, hover_color=BORDER, text_color=TEXT).pack(
+            side="left", padx=(0, 6))
 
     tz_info = ctk.CTkLabel(bottom, text="", font=F(12), text_color=MUTED, justify="left",
-                           anchor="w", wraplength=310)
+                           anchor="w", wraplength=340)
     tz_info.pack(fill="x")
 
     urow = ctk.CTkFrame(bottom, fg_color="transparent")
@@ -623,7 +808,7 @@ def run_gui(initial_files):
     def save_settings():
         data = {"unit": v_unit.get(), "distance": v_dist.get(), "min_ppi": v_ppi.get(),
                 "scale": v_scale.get(), "tol": v_tol.get(), "allow": v_allow.get(),
-                "rgb_warn": v_rgb.get(), "tz": tz.get("1.0", "end").strip(),
+                "rgb_warn": v_rgb.get(), "tz_rows": rows_data(),
                 "theme": ctk.get_appearance_mode().lower(), "adv": state["adv"]}
         try:
             with open(settings_path(), "w", encoding="utf-8") as fh:
@@ -637,6 +822,7 @@ def run_gui(initial_files):
     def toggle_theme():
         ctk.set_appearance_mode("dark" if ctk.get_appearance_mode() == "Light" else "light")
         render_theme()
+        render()
         save_settings()
 
     theme_btn.configure(command=toggle_theme)
@@ -651,6 +837,8 @@ def run_gui(initial_files):
             if not isinstance(child, ctk.CTkButton):
                 clickable(child, callback)
 
+
+
     def row_key(r):
         return (r["doc"]["path"], r["page"]["pno"] if r.get("page") else 0)
 
@@ -662,6 +850,17 @@ def run_gui(initial_files):
         box.pack(fill="x", pady=(0, 10), padx=(0, 6))
         ctk.CTkFrame(box, width=5, height=10, fg_color=S_BAR[status], corner_radius=3).pack(
             side="left", fill="y", padx=(8, 0), pady=10)
+        thumb = r["page"].get("thumb") if r.get("page") else None
+        if thumb:
+            try:
+                if key not in state["thumbs"]:
+                    state["thumbs"][key] = tk.PhotoImage(data=thumb)
+                dark = ctk.get_appearance_mode() == "Dark"
+                tk.Label(box, image=state["thumbs"][key], bd=0, width=80, bg=CARD[1 if dark else 0],
+                         highlightthickness=0).pack(
+                    side="left", anchor="n", padx=(12, 0), pady=14)
+            except Exception:
+                pass
         inner = ctk.CTkFrame(box, fg_color="transparent")
         inner.pack(side="left", fill="both", expand=True, padx=14, pady=12)
 
@@ -718,8 +917,9 @@ def run_gui(initial_files):
                 empty_hint.configure(text="Осталось: %d" % state["busy"])
             else:
                 empty_title.configure(text="Перетащите PDF или папку сюда" if dnd else "Добавьте PDF-файлы")
-                empty_hint.configure(text="Программа сверит размеры с ТЗ и проверит\n"
-                                          "разрешение, шрифты и цвет")
+                empty_hint.configure(text="1. Слева впишите размеры из ТЗ\n"
+                                          "2. Добавьте PDF с макетами\n"
+                                          "3. Красные карточки нужно исправить, зелёные готовы")
             title.configure(text="Макеты")
             filt.pack_forget()
             state["filters"] = {}
@@ -739,7 +939,7 @@ def run_gui(initial_files):
         if summary["missing"]:
             notes.append("Нет макетов для позиций ТЗ: " + "; ".join(summary["missing"]))
         if state["bad"]:
-            notes.append("Не понял строки ТЗ (нет размера): " + "; ".join(state["bad"]))
+            notes.append("В ТЗ не заполнен размер (поля подсвечены красным): " + "; ".join(state["bad"]))
         if notes:
             banner_text.configure(text="\n".join(notes))
             banner.pack(fill="x", pady=(12, 0), before=body)
@@ -757,7 +957,7 @@ def run_gui(initial_files):
     def refresh(*_):
         state["job"] = None
         st = current_settings()
-        specs, bad = parse_specs(tz.get("1.0", "end"), st["unit"])
+        specs, bad = get_specs()
         rows, summary = evaluate(state["docs"], specs, st)
         state.update(rows=rows, summary=summary, bad=bad)
         if st["min_ppi"]:
@@ -765,8 +965,8 @@ def run_gui(initial_files):
         else:
             ppi_info.configure(text="Нужно разрешение от %.0f ppi" % summary["target"])
         if not specs:
-            tz_info.configure(text="Без ТЗ размер не сверяется: проверяются только\n"
-                                   "разрешение, шрифты и цвет.", text_color=MUTED)
+            tz_info.configure(text="Без размеров проверяются только разрешение,\n"
+                                   "шрифты и цвет.", text_color=MUTED)
         elif not state["docs"]:
             tz_info.configure(text="Позиций в ТЗ: %d" % summary["spec_total"], text_color=MUTED)
         else:
@@ -877,7 +1077,6 @@ def run_gui(initial_files):
                     pass
 
     body.bind("<Configure>", on_resize)
-    tz.bind("<KeyRelease>", schedule)
     for var in (v_unit, v_dist, v_ppi, v_scale, v_tol, v_allow, v_rgb):
         var.trace_add("write", schedule)
     if dnd:
@@ -886,6 +1085,13 @@ def run_gui(initial_files):
     clickable(empty, lambda _e: add_files())
 
     root.protocol("WM_DELETE_WINDOW", lambda: (save_settings(), root.destroy()))
+    if saved.get("tz_rows"):
+        for values in saved["tz_rows"]:
+            add_row((list(values) + ["", "", "", ""])[:4])
+    elif saved.get("tz"):
+        add_specs(parse_specs(saved["tz"], v_unit.get())[0])
+    while len(tz_rows) < 4:
+        add_row()
     render_theme()
     render_adv()
     refresh()
