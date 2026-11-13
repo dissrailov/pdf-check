@@ -36,10 +36,12 @@ ICON = {INFO: "•", OK: "✓", WARN: "!", FAIL: "✕"}
 AUTO_SCALES = [1, 2, 4, 5, 10, 20, 25, 50, 100]
 UNIT_MM = {"мм": 1.0, "mm": 1.0, "см": 10.0, "cm": 10.0, "м": 1000.0, "m": 1000.0}
 
+_UNIT = r"(?:(мм|см|м|mm|cm|m)(?![а-яёa-z]))?"
 SIZE_RE = re.compile(
-    r"(\d+(?:[.,]\d+)?)\s*(?:(мм|см|м|mm|cm|m)(?![а-яёa-z]))?\s*[xх×*]\s*"
-    r"(\d+(?:[.,]\d+)?)\s*(?:(мм|см|м|mm|cm|m)(?![а-яёa-z]))?", re.I)
-COUNT_RE = re.compile(r"(\d+)\s*шт", re.I)
+    r"(\d+(?:[.,]\d+)?)\s*" + _UNIT + r"(?:\s*[xх×*]\s*|\s+на\s+)(\d+(?:[.,]\d+)?)\s*" + _UNIT, re.I)
+COUNT_RE = re.compile(r"(\d+)\s*шт\.?", re.I)
+MULT_RE = re.compile(r"^\s*[xх×*]\s*(\d+)\s*$", re.I)
+MAX_PPI = 150.0  # выше для широкоформатной печати разрешение не нужно
 RGB_OP = re.compile(rb"(?<![\w/.])(?:-?\d*\.?\d+\s+){3}(?:rg|RG)(?![\w])")
 # похожие буквы: «З1» и «31», кириллическая и латинская «А» считаются одним и тем же
 LOOKALIKE = str.maketrans("авекмнорстухз", "abekmhopctyx3")
@@ -71,16 +73,25 @@ def parse_specs(text, default_unit):
         if not m:
             bad.append(line)
             continue
-        unit = (m.group(4) or m.group(2) or default_unit).lower()
-        k = UNIT_MM.get(unit, UNIT_MM[default_unit])
-        w = float(m.group(1).replace(",", ".")) * k
-        h = float(m.group(3).replace(",", ".")) * k
-        rest = line[m.end():]
-        cm = COUNT_RE.search(rest)
-        count = max(1, int(cm.group(1))) if cm else 1
-        name = line[:m.start()].strip(" \t:;,-–—=")
-        if not name:
-            name = COUNT_RE.sub("", rest).strip(" \t:;,-–—=")
+        u1 = (m.group(2) or m.group(4) or default_unit).lower()
+        u2 = (m.group(4) or m.group(2) or default_unit).lower()
+        w = float(m.group(1).replace(",", ".")) * UNIT_MM[u1]
+        h = float(m.group(3).replace(",", ".")) * UNIT_MM[u2]
+        before, rest = line[:m.start()], line[m.end():]
+        count = 1
+        mult = MULT_RE.match(rest)
+        found = COUNT_RE.search(rest) or COUNT_RE.search(before)
+        if mult:
+            count, rest = int(mult.group(1)), ""
+        elif found:
+            count = int(found.group(1))
+            before, rest = COUNT_RE.sub("", before), COUNT_RE.sub("", rest)
+        count = max(1, min(count, 999))
+        strip = " \t:;,.-–—="
+        name = before.strip(strip) or rest.strip(strip)
+        if w <= 0 or h <= 0:
+            bad.append(line)
+            continue
         specs.append(Spec(name, w, h, count))
     return specs, bad
 
@@ -163,20 +174,44 @@ def image_cs(doc, info):
     return cs_label(info)
 
 
-def vector_has_rgb(doc, page):
-    chunks = []
+NAMED_CS_USE = re.compile(rb"/([^\s/\[\]<>()]+)\s+(?:cs|CS)(?![\w])")
+NAMED_CS_DEF = re.compile(r"/([^\s/\[\]<>()]+)\s*(\d+\s+\d+\s+R|\[[^\]]*\]|/\w+)")
+
+
+def named_rgb_spaces(doc, xref):
+    """Имена цветовых пространств из ресурсов объекта, которые являются RGB."""
     try:
-        chunks.append(page.read_contents())
+        kind, value = doc.xref_get_key(xref, "Resources/ColorSpace")
+        if kind == "xref":
+            value = doc.xref_object(int(value.split()[0]), compressed=True)
+        elif kind != "dict":
+            return set()
+        return {m.group(1) for m in NAMED_CS_DEF.finditer(value)
+                if _cs_from_text(doc, m.group(2)) == "RGB"}
+    except Exception:
+        return set()
+
+
+def vector_has_rgb(doc, page):
+    """RGB в векторе и тексте: операторы rg/RG и именованные RGB-пространства (ICC и т. п.)."""
+    try:
+        page_names = named_rgb_spaces(doc, page.xref)
+        streams = [(page.read_contents(), page_names)]
         for xo in page.get_xobjects():
             try:
                 data = doc.xref_stream(xo[0])
                 if data:
-                    chunks.append(data)
+                    streams.append((data, named_rgb_spaces(doc, xo[0]) | page_names))
             except Exception:
                 pass
+        for data, names in streams:
+            if RGB_OP.search(data):
+                return True
+            if names and any(n.decode("latin-1") in names for n in NAMED_CS_USE.findall(data)):
+                return True
     except Exception:
         pass
-    return bool(RGB_OP.search(b"\n".join(chunks)))
+    return False
 
 
 def analyze_pdf(path):
@@ -188,16 +223,20 @@ def analyze_pdf(path):
             return res
         for pno in range(doc.page_count):
             page = doc[pno]
-            media, trim = page.mediabox, page.trimbox
-            w, h = trim.width, trim.height
-            bleed = max(media.width - trim.width, media.height - trim.height) / 2.0
+            media, trim, crop = page.mediabox, page.trimbox, page.cropbox
+            # UserUnit: у макетов больше 5 м размеры в файле записаны с множителем
+            uu = max(page.rect.width, page.rect.height) / max(crop.width, crop.height, 1e-6)
+            if not 0.5 < uu < 1000 or abs(uu - 1) < 0.001:
+                uu = 1.0
+            w, h = trim.width * uu, trim.height * uu
+            bleed = max(media.width - trim.width, media.height - trim.height) / 2.0 * uu
             if page.rotation in (90, 270):
                 w, h = h, w
             images = []
             for info in page.get_image_info(xrefs=True):
                 pw, ph = info.get("width", 0), info.get("height", 0)
-                if pw <= 2 and ph <= 2:
-                    continue
+                if min(pw, ph) <= 4:
+                    continue  # заливки и полоски градиентов, а не изображения
                 a, b, c, d = info["transform"][:4]
                 dw, dh = math.hypot(a, b), math.hypot(c, d)
                 if dw <= 0 or dh <= 0:
@@ -229,6 +268,11 @@ def analyze_pdf(path):
 # ----------------------------------------------------------------------------
 # Оценка по настройкам и ТЗ
 # ----------------------------------------------------------------------------
+def share(fraction):
+    pct = min(fraction, 1.0) * 100
+    return "<1%" if pct < 1 else "%.0f%%" % pct
+
+
 def needed_ppi(distance_m):
     return 3438.0 / (max(distance_m, 0.05) * 100.0 / 2.54)
 
@@ -252,7 +296,7 @@ def match_size(pw, ph, spec, tol, allow, scales):
 def evaluate(docs, specs, st):
     """Возвращает список результатов (по одному на страницу) и сводку."""
     unit = st["unit"]
-    target = st["min_ppi"] if st["min_ppi"] else needed_ppi(st["distance"])
+    target = st["min_ppi"] if st["min_ppi"] else min(needed_ppi(st["distance"]), MAX_PPI)
     soft = target * 0.7
     scales = AUTO_SCALES if st["scale"] is None else [st["scale"]]
     default_scale = 1.0 if st["scale"] is None else st["scale"]
@@ -285,6 +329,7 @@ def evaluate(docs, specs, st):
             r["match"] = match_size(r["page"]["w_mm"], r["page"]["h_mm"], best,
                                     st["tol"], st["allow"], scales)
             best.used += 1
+            r["extra"] = best.used > best.count
     for r in page_rows:
         if r["spec"] is not None:
             continue
@@ -298,6 +343,7 @@ def evaluate(docs, specs, st):
             cands.sort(key=lambda c: c[:4])
             r["spec"], r["match"] = cands[0][4], cands[0][5]
             r["spec"].used += 1
+            r["extra"] = r["spec"].used > r["spec"].count
 
     for r in page_rows:
         p, sp, m = r["page"], r["spec"], r["match"]
@@ -321,6 +367,8 @@ def evaluate(docs, specs, st):
             meta.append(sp.name or "ТЗ")
         else:
             how = "по имени файла" if r["by_name"] else "по размеру"
+            if m[0] != 1:
+                how += ", макет в масштабе 1:%g" % m[0]
             if m[1] == "rot":
                 checks.append((WARN, "Размер", "совпадает с %s, но макет повёрнут на 90°."
                                % spec_label(sp, unit), []))
@@ -330,6 +378,10 @@ def evaluate(docs, specs, st):
             else:
                 checks.append((OK, "Размер", "совпадает с %s (%s)." % (spec_label(sp, unit), how), []))
             meta.append("ТЗ: " + (sp.name or fmt_size(sp.w, sp.h, unit)))
+        if sp is not None and r.get("extra"):
+            checks.append((WARN, "Лишний макет", "для позиции «%s» в ТЗ нужно %d шт., макетов больше. "
+                           "Возможно, это дубль или старая версия."
+                           % (sp.name or fmt_size(sp.w, sp.h, unit), sp.count), []))
         if scale != 1:
             meta.append("масштаб 1:%g" % scale)
 
@@ -345,9 +397,11 @@ def evaluate(docs, specs, st):
             meta.append("вектор")
         else:
             worst = max(i[1] for i in imgs)
-            sub = ["%-8s %4.0f ppi   %d × %d px   на баннере %s   %s"
+            page_area = max(p["w_mm"] * p["h_mm"], 1e-6)
+            sub = ["%-8s %4.0f ppi   %d × %d px   на баннере %s   %s   %s площади"
                    % (TAG[s], ppi, im["px_w"], im["px_h"],
-                      fmt_size(im["w_mm"] * scale, im["h_mm"] * scale, unit), im["cs"])
+                      fmt_size(im["w_mm"] * scale, im["h_mm"] * scale, unit), im["cs"],
+                      share(im["w_mm"] * im["h_mm"] / page_area))
                    for ppi, s, im in imgs[:20]]
             if len(imgs) > 20:
                 sub.append("... и ещё %d картинок с разрешением выше" % (len(imgs) - 20))
@@ -480,7 +534,7 @@ def run_gui(initial_files):
               "  pip install customtkinter")
         return None
     import tkinter as tk
-    from tkinter import filedialog
+    from tkinter import filedialog, messagebox
 
     saved = {}
     try:
@@ -523,7 +577,7 @@ def run_gui(initial_files):
     v_filter = tk.StringVar(value="Все")
 
     state = {"docs": [], "rows": [], "summary": None, "bad": [], "job": None, "busy": 0,
-             "open": set(), "thumbs": {}, "adv": bool(saved.get("adv", False)), "wrap": [], "filters": {}}
+             "open": set(), "thumbs": {}, "sig": None, "limit": 40, "gen": 0, "pending": set(), "adv": bool(saved.get("adv", False)), "wrap": [], "filters": {}}
     q = queue.Queue()
 
     def button(parent, text, command, primary=False, width=0, **kw):
@@ -624,7 +678,7 @@ def run_gui(initial_files):
                     row[key].configure(border_color=BORDER)
                 continue
             w, h = to_float(ws), to_float(hs)
-            n = 1 if not ns else (int(ns) if ns.isdigit() and int(ns) >= 1 else None)
+            n = 1 if not ns else (int(ns) if re.fullmatch(r"[0-9]{1,3}", ns) and int(ns) >= 1 else None)
             row["w"].configure(border_color=BORDER if w else S_BAR[FAIL])
             row["h"].configure(border_color=BORDER if h else S_BAR[FAIL])
             row["n"].configure(border_color=BORDER if n else S_BAR[FAIL])
@@ -679,7 +733,14 @@ def run_gui(initial_files):
                 win.destroy()
 
         button(win, "Добавить в ТЗ", apply, primary=True).pack(anchor="e", padx=18, pady=(8, 16))
-        win.after(150, lambda: (win.lift(), box.focus_set()))
+        def show():
+            try:
+                win.lift()
+                win.grab_set()
+                box.focus_set()
+            except Exception:
+                pass
+        win.after(250, show)
 
     tz_btns = ctk.CTkFrame(bottom, fg_color="transparent")
     tz_btns.pack(fill="x", pady=(0, 6))
@@ -872,7 +933,7 @@ def run_gui(initial_files):
             side="left", padx=12)
         ctk.CTkButton(head, text="✕", width=30, height=28, corner_radius=8, font=F(13),
                       fg_color="transparent", hover_color=SOFT, text_color=MUTED,
-                      command=lambda: remove_doc(r["doc"])).pack(side="right")
+                      command=lambda: remove_row_card(r)).pack(side="right")
         ctk.CTkLabel(head, text="Скрыть ▴" if is_open else "Подробнее ▾", font=F(12),
                      text_color=MUTED).pack(side="right", padx=8)
 
@@ -905,6 +966,14 @@ def run_gui(initial_files):
 
     def render():
         rows, summary = state["rows"], state["summary"]
+        sig = (ctk.get_appearance_mode(), v_filter.get().split(" ")[0], state["busy"] > 0,
+               tuple(sorted(state["open"])), tuple(state["bad"]),
+               tuple(summary["missing"]) if summary else (), state["gen"], state["limit"],
+               tuple((r["title"], r["status"], tuple(r["meta"]),
+                      tuple((c[0], c[1], c[2], tuple(c[3])) for c in r["checks"])) for r in rows))
+        if sig == state["sig"]:
+            return
+        state["sig"] = sig
         for w in lst.winfo_children():
             w.destroy()
         state["wrap"] = []
@@ -939,7 +1008,8 @@ def run_gui(initial_files):
         if summary["missing"]:
             notes.append("Нет макетов для позиций ТЗ: " + "; ".join(summary["missing"]))
         if state["bad"]:
-            notes.append("В ТЗ не заполнен размер (поля подсвечены красным): " + "; ".join(state["bad"]))
+            notes.append("В ТЗ есть строки с ошибкой, они не учитываются (поля подсвечены красным): "
+                         + "; ".join(state["bad"]))
         if notes:
             banner_text.configure(text="\n".join(notes))
             banner.pack(fill="x", pady=(12, 0), before=body)
@@ -949,8 +1019,13 @@ def run_gui(initial_files):
         lst.pack(fill="both", expand=True)
         visible = [r for r in rows if current is None or r["status"] == current]
         visible.sort(key=lambda r: -r["status"])
-        for r in visible:
+        for r in visible[:state["limit"]]:
             make_card(r)
+        if len(visible) > state["limit"]:
+            def more():
+                state["limit"] += 40
+                render()
+            button(lst, "Показать ещё %d" % min(40, len(visible) - state["limit"]), more).pack(pady=(4, 16))
         if not visible:
             ctk.CTkLabel(lst, text="В этой категории пусто", font=F(13), text_color=MUTED).pack(pady=40)
 
@@ -963,7 +1038,9 @@ def run_gui(initial_files):
         if st["min_ppi"]:
             ppi_info.configure(text="Задан свой порог: от %.0f ppi" % summary["target"])
         else:
-            ppi_info.configure(text="Нужно разрешение от %.0f ppi" % summary["target"])
+            capped = needed_ppi(st["distance"]) > MAX_PPI
+            ppi_info.configure(text="Нужно разрешение от %.0f ppi%s" % (
+                summary["target"], " (больше для печати не требуется)" if capped else ""))
         if not specs:
             tz_info.configure(text="Без размеров проверяются только разрешение,\n"
                                    "шрифты и цвет.", text_color=MUTED)
@@ -990,25 +1067,37 @@ def run_gui(initial_files):
                     files += [os.path.join(dirpath, n) for n in sorted(names) if n.lower().endswith(".pdf")]
             elif p.lower().endswith(".pdf") and os.path.isfile(p):
                 files.append(p)
-        known = {os.path.normcase(os.path.abspath(d["path"])) for d in state["docs"]}
-        files = [f for f in files if os.path.normcase(os.path.abspath(f)) not in known]
+        norm = lambda f: os.path.normcase(os.path.abspath(f))
+        known = {norm(d["path"]) for d in state["docs"]} | state["pending"]
+        unique = []
+        for f in files:
+            if norm(f) not in known:
+                known.add(norm(f))
+                unique.append(f)
+        files = unique
         if not files:
             return
+        state["pending"].update(norm(f) for f in files)
         state["busy"] += len(files)
         title.configure(text="Читаю файлы: %d..." % state["busy"])
         if not state["rows"]:
             render()
+        gen = state["gen"]
 
         def work():
             for f in files:
-                q.put(analyze_pdf(f))
+                q.put((gen, analyze_pdf(f)))
         threading.Thread(target=work, daemon=True).start()
 
     def poll():
         got = False
         try:
             while True:
-                state["docs"].append(q.get_nowait())
+                gen, doc = q.get_nowait()
+                if gen != state["gen"]:
+                    continue  # результат от уже сброшенного списка
+                state["docs"].append(doc)
+                state["pending"].discard(os.path.normcase(os.path.abspath(doc["path"])))
                 state["busy"] -= 1
                 got = True
         except queue.Empty:
@@ -1021,6 +1110,14 @@ def run_gui(initial_files):
                 refresh()
         root.after(120, poll)
 
+    def reset_list():
+        state["gen"] += 1
+        state["limit"] = 40
+        state["docs"] = []
+        state["busy"] = 0
+        state["pending"].clear()
+        state["thumbs"].clear()
+
     def add_files():
         add_paths(filedialog.askopenfilenames(title="Выберите PDF", filetypes=[("PDF", "*.pdf")]))
 
@@ -1031,18 +1128,22 @@ def run_gui(initial_files):
 
     def recheck():
         paths = [d["path"] for d in state["docs"]]
-        state["docs"] = []
+        reset_list()
         if paths:
             add_paths(paths)
         else:
             refresh()
 
-    def remove_doc(doc):
-        state["docs"] = [d for d in state["docs"] if d is not doc]
+    def remove_row_card(r):
+        doc, page = r["doc"], r.get("page")
+        if page is not None and len(doc["pages"]) > 1:
+            doc["pages"].remove(page)  # у многостраничного файла убираем только эту страницу
+        else:
+            state["docs"] = [d for d in state["docs"] if d is not doc]
         refresh()
 
     def clear():
-        state["docs"] = []
+        reset_list()
         state["open"].clear()
         refresh()
 
@@ -1057,8 +1158,11 @@ def run_gui(initial_files):
                                             initialdir=first, initialfile="проверка_макетов.txt",
                                             filetypes=[("Текст", "*.txt")])
         if path:
-            with open(path, "w", encoding="utf-8-sig") as fh:
-                fh.write(report_text())
+            try:
+                with open(path, "w", encoding="utf-8-sig") as fh:
+                    fh.write(report_text())
+            except OSError as e:
+                messagebox.showerror(APP_NAME, "Не удалось сохранить отчёт:\n%s" % e)
 
     def copy_report():
         if state["rows"]:
@@ -1066,10 +1170,10 @@ def run_gui(initial_files):
             root.clipboard_append(report_text())
 
     def on_resize(event):
-        px = max(300, int(event.width / ctk.ScalingTracker.get_window_scaling(root)) - 120)
+        px = max(300, int(event.width / ctk.ScalingTracker.get_window_scaling(root)) - 230)
         if abs(px - state.get("wrap_px", 0)) > 20:
             state["wrap_px"] = px
-            banner_text.configure(wraplength=px + 60)
+            banner_text.configure(wraplength=px + 170)
             for lab in state["wrap"]:
                 try:
                     lab.configure(wraplength=px)
@@ -1084,6 +1188,28 @@ def run_gui(initial_files):
         root.dnd_bind("<<Drop>>", lambda e: add_paths(root.tk.splitlist(e.data)))
     clickable(empty, lambda _e: add_files())
 
+    def on_error(exc, val, tb):
+        import traceback
+        text = "".join(traceback.format_exception(exc, val, tb))
+        if not state.get("error_shown"):
+            state["error_shown"] = True
+            messagebox.showerror(APP_NAME, "В программе произошла ошибка. Пришлите этот текст "
+                                           "разработчику:\n\n" + text[-1500:])
+            state["error_shown"] = False
+
+    root.report_callback_exception = on_error
+
+    def hotkey(event):
+        # В русской раскладке Tk не узнаёт Ctrl+C / V / X / A, чиним по коду клавиши.
+        if sys.platform != "win32" or event.keysym.lower() in ("c", "v", "x", "a"):
+            return None
+        action = {67: "<<Copy>>", 86: "<<Paste>>", 88: "<<Cut>>", 65: "<<SelectAll>>"}.get(event.keycode)
+        if action:
+            event.widget.event_generate(action)
+            return "break"
+        return None
+
+    root.bind_all("<Control-KeyPress>", hotkey, add="+")
     root.protocol("WM_DELETE_WINDOW", lambda: (save_settings(), root.destroy()))
     if saved.get("tz_rows"):
         for values in saved["tz_rows"]:
