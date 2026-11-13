@@ -165,6 +165,35 @@ def test_colour():
         assert pc._cs_from_text(fitz.open(), text) == want, text
 
 
+def test_vector_gradient_is_not_an_image():
+    """Градиент (shading) не должен попадать в список картинок с разрешением 72 ppi."""
+    def gradient(cs):
+        def add(doc, page):
+            fn = doc.get_new_xref()
+            c0, c1 = ("[1 0 0]", "[0 0 1]") if cs == "/DeviceRGB" else ("[0 1 0 0]", "[1 0 0 0]")
+            doc.update_object(fn, "<</FunctionType 2/Domain[0 1]/C0%s/C1%s/N 1>>" % (c0, c1))
+            sh = doc.get_new_xref()
+            doc.update_object(sh, "<</ShadingType 2/ColorSpace %s/Coords[0 0 1 0]/Function %d 0 R"
+                                  "/Extend[true true]>>" % (cs, fn))
+            kind, value = doc.xref_get_key(page.xref, "Resources")
+            target, key = (int(value.split()[0]), "Shading") if kind == "xref" else (page.xref, "Resources/Shading")
+            doc.xref_set_key(target, key, "<</Sh0 %d 0 R>>" % sh)
+            extra = doc.get_new_xref()
+            doc.update_object(extra, "<<>>")
+            doc.update_stream(extra, b"q 2000 0 0 2000 0 0 cm /Sh0 sh Q")
+            old = doc.xref_get_key(page.xref, "Contents")[1].strip("[]")
+            doc.xref_set_key(page.xref, "Contents", "[%s %d 0 R]" % (old, extra))
+        return add
+    d = make("grad_cmyk.pdf", 1000, 1000, image=(4000, 4000), extra=gradient("/DeviceCMYK"))
+    page = d["pages"][0]
+    assert [(i["px_w"], i["px_h"]) for i in page["images"]] == [(4000, 4000)], page["images"]
+    assert not page["vec_rgb"]
+    rows, _ = run([d], "")
+    assert rows[0]["status"] == pc.OK, rows[0]["checks"]
+    d = make("grad_rgb.pdf", 1000, 1000, extra=gradient("/DeviceRGB"))
+    assert d["pages"][0]["images"] == [] and d["pages"][0]["vec_rgb"]
+
+
 def test_fonts():
     rows, _ = run([make("font.pdf", 500, 500, text=True)], "")
     assert check(rows[0], "Шрифты")[0] == pc.FAIL

@@ -192,22 +192,62 @@ def named_rgb_spaces(doc, xref):
         return set()
 
 
-def vector_has_rgb(doc, page):
-    """RGB в векторе и тексте: операторы rg/RG и именованные RGB-пространства (ICC и т. п.)."""
+SHADING_USE = re.compile(rb"/([^\s/\[\]<>()]+)\s+sh(?![\w])")
+SHADING_DEF = re.compile(r"/([^\s/\[\]<>()]+)\s*(\d+)\s+\d+\s+R")
+INLINE_IMAGE = re.compile(rb"(?:^|\s)BI\s.{0,400}?\sID\s", re.S)
+
+
+def rgb_shadings(doc, xref):
+    """Имена градиентов (shading) из ресурсов объекта, заданных в RGB."""
     try:
-        page_names = named_rgb_spaces(doc, page.xref)
-        streams = [(page.read_contents(), page_names)]
+        kind, value = doc.xref_get_key(xref, "Resources/Shading")
+        if kind == "xref":
+            value = doc.xref_object(int(value.split()[0]), compressed=True)
+        elif kind != "dict":
+            return set()
+        names = set()
+        for m in SHADING_DEF.finditer(value):
+            cs_kind, cs_value = doc.xref_get_key(int(m.group(2)), "ColorSpace")
+            if cs_kind != "null" and _cs_from_text(doc, cs_value) == "RGB":
+                names.add(m.group(1))
+        return names
+    except Exception:
+        return set()
+
+
+def content_streams(doc, page):
+    """Потоки содержимого страницы и её форм вместе с xref объекта, чьи ресурсы они используют."""
+    streams = []
+    try:
+        streams.append((page.read_contents(), page.xref))
         for xo in page.get_xobjects():
             try:
                 data = doc.xref_stream(xo[0])
                 if data:
-                    streams.append((data, named_rgb_spaces(doc, xo[0]) | page_names))
+                    streams.append((data, xo[0]))
             except Exception:
                 pass
-        for data, names in streams:
+    except Exception:
+        pass
+    return streams
+
+
+def has_inline_images(doc, page):
+    return any(INLINE_IMAGE.search(data) for data, _x in content_streams(doc, page))
+
+
+def vector_has_rgb(doc, page):
+    """RGB в векторе и тексте: операторы rg/RG, именованные RGB-пространства и RGB-градиенты."""
+    try:
+        page_cs, page_sh = named_rgb_spaces(doc, page.xref), rgb_shadings(doc, page.xref)
+        for data, xref in content_streams(doc, page):
             if RGB_OP.search(data):
                 return True
+            names = page_cs if xref == page.xref else named_rgb_spaces(doc, xref) | page_cs
             if names and any(n.decode("latin-1") in names for n in NAMED_CS_USE.findall(data)):
+                return True
+            shades = page_sh if xref == page.xref else rgb_shadings(doc, xref) | page_sh
+            if shades and any(n.decode("latin-1") in shades for n in SHADING_USE.findall(data)):
                 return True
     except Exception:
         pass
@@ -233,7 +273,11 @@ def analyze_pdf(path):
             if page.rotation in (90, 270):
                 w, h = h, w
             images = []
+            inline = has_inline_images(doc, page)
             for info in page.get_image_info(xrefs=True):
+                if not inline and not info.get("xref"):
+                    # Не картинка: так движок показывает векторные градиенты (всегда «72 ppi»).
+                    continue
                 pw, ph = info.get("width", 0), info.get("height", 0)
                 if min(pw, ph) <= 4:
                     continue  # заливки и полоски градиентов, а не изображения
@@ -241,7 +285,10 @@ def analyze_pdf(path):
                 dw, dh = math.hypot(a, b), math.hypot(c, d)
                 if dw <= 0 or dh <= 0:
                     continue
-                images.append({"px_w": pw, "px_h": ph, "w_mm": dw * PT_TO_MM,
+                box = fitz.Rect(info["bbox"]) & page.rect  # видимая на странице часть
+                visible = 0.0 if box.is_empty else box.width * box.height / max(
+                    page.rect.width * page.rect.height, 1e-6)
+                images.append({"px_w": pw, "px_h": ph, "w_mm": dw * PT_TO_MM, "visible": visible,
                                "h_mm": dh * PT_TO_MM, "cs": image_cs(doc, info)})
             missing = sorted({f[3] for f in doc.get_page_fonts(pno, full=True)
                               if f[1] == "n/a" and f[2] != "Type3"})
@@ -297,7 +344,7 @@ def evaluate(docs, specs, st):
     """Возвращает список результатов (по одному на страницу) и сводку."""
     unit = st["unit"]
     target = st["min_ppi"] if st["min_ppi"] else min(needed_ppi(st["distance"]), MAX_PPI)
-    soft = target * 0.7
+    soft = target * 0.6  # ниже 60% от нормы пиксели уже заметны, между 60% и 100% «мягковато»
     scales = AUTO_SCALES if st["scale"] is None else [st["scale"]]
     default_scale = 1.0 if st["scale"] is None else st["scale"]
     for sp in specs:
@@ -401,12 +448,11 @@ def evaluate(docs, specs, st):
             sub = ["%-8s %4.0f ppi   %d × %d px   на баннере %s   %s   %s площади"
                    % (TAG[s], ppi, im["px_w"], im["px_h"],
                       fmt_size(im["w_mm"] * scale, im["h_mm"] * scale, unit), im["cs"],
-                      share(im["w_mm"] * im["h_mm"] / page_area))
+                      share(im.get("visible", im["w_mm"] * im["h_mm"] / page_area)))
                    for ppi, s, im in imgs[:20]]
             if len(imgs) > 20:
                 sub.append("... и ещё %d картинок с разрешением выше" % (len(imgs) - 20))
-            big = max(p["images"], key=lambda i: i["w_mm"] * i["h_mm"])
-            if big["w_mm"] * big["h_mm"] >= 0.9 * p["w_mm"] * p["h_mm"] and not p["has_text"]:
+            if max(i.get("visible", 0) for i in p["images"]) >= 0.97 and not p["has_text"]:
                 sub.append("Страница целиком растровая: если на ней есть текст, он тоже картинкой.")
             text = "минимум в макете %.0f ppi, нужно от %.0f ppi." % (imgs[0][0], target)
             if worst == FAIL:
